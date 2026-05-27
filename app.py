@@ -103,7 +103,11 @@ def _build_reply(dates_oncall: dict, regression_by_friday: dict, poster_username
 
     regression_section = ""
     if regression_lines:
-        regression_section = "\n\n🧪 *리그레이션 테스트 담당자*\n\n" + "\n\n".join(regression_lines)
+        regression_section = (
+            "\n\n🧪 *리그레이션 테스트 담당자*\n\n"
+            + "\n\n".join(regression_lines)
+            + "\n\n_※ 테스트 완료 후 <https://www.notion.so/croquis/AOS-KPI-5f0d9190fbc34ff9959c034d9cb04136|AOS KPI 노션>에 수치도 입력해 주세요!_"
+        )
 
     # ── 경고 섹션 ──
     warning_section = ""
