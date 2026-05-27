@@ -1,5 +1,5 @@
 """
-Slack Bolt 앱 - 휴가 메시지 감지 → PagerDuty 온콜 확인 → 스레드 답글
+Slack Bolt 앱 - 휴가 메시지 감지 → PagerDuty 온콜 + Jira 리그레이션 확인 → 스레드 답글
 """
 
 import logging
@@ -14,6 +14,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from llm_parser import parse_vacation
 from pagerduty import get_oncall_by_platform
+from jira_regression import get_regression_assignees_for_dates
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,35 +42,30 @@ def _get_slack_username(client, user_id: str) -> str:
         return ""
 
 
-def _is_same_user(slack_username: str, pagerduty_name: str) -> bool:
+def _is_same_user(slack_username: str, pd_or_jira_name: str) -> bool:
     """
-    Slack username과 PagerDuty summary 비교
-    예) slack: "leo.yangdroid"  pd: "leo.yangdroid(유양우)" → True
+    Slack username과 PagerDuty/Jira name 비교
+    예) slack: "hashy.tag"  name: "hashy.tag(해시)" or "해시(hashy.tag)/팀명" → True
     """
-    if not slack_username or not pagerduty_name:
+    if not slack_username or not pd_or_jira_name:
         return False
-    return pagerduty_name.lower().startswith(slack_username.lower())
+    return slack_username.lower() in pd_or_jira_name.lower()
 
 
-def _build_reply(dates_oncall: dict, poster_username: str) -> str:
+def _build_reply(dates_oncall: dict, regression_by_friday: dict, poster_username: str) -> str:
     """
-    dates_oncall: {
-        "2026-05-28": {
-            "aos": {"name": "llewyn.62s(박종혁)", "email": "..."},
-            "ios": {"name": "dew.0601", "email": "..."},
-        }
-    }
+    dates_oncall: {"2026-05-28": {"aos": {"name":..,"email":..}, "ios": {...}}}
+    regression_by_friday: {date(2026,5,30): {"display_name":..,"slack_username":..,"issue_key":..,"friday":..}}
     poster_username: 휴가 올린 사람의 Slack username
     """
+    warnings = []
     blocks = []
-    conflict_dates = []
 
+    # ── 온콜 섹션 ──
     for d_str, platforms in sorted(dates_oncall.items()):
         d = date.fromisoformat(d_str)
         label = _date_label(d)
-
         lines = [f"*{label}*"]
-        is_conflict = False
 
         for platform, oncall in platforms.items():
             if oncall is None:
@@ -77,30 +73,53 @@ def _build_reply(dates_oncall: dict, poster_username: str) -> str:
                 continue
 
             name = oncall["name"]
-
             if _is_same_user(poster_username, name):
                 lines.append(f">:warning: {platform}: {name}  ← *본인*")
-                is_conflict = True
+                warnings.append(f"• {label} {platform} 온콜")
             else:
                 lines.append(f">{platform}: {name}")
 
-        if is_conflict:
-            conflict_dates.append(label)
-
         blocks.append("\n".join(lines))
 
-    reply = "📋 *온콜 확인 결과*\n\n" + "\n\n".join(blocks)
+    oncall_section = "📋 *온콜 확인 결과*\n\n" + "\n\n".join(blocks)
 
-    if conflict_dates:
-        dates_str = ", ".join(conflict_dates)
-        reply += f"\n\n⚠️ *온콜 일정 변경 필요!*\n{dates_str}에 본인이 온콜입니다. 담당자를 변경해 주세요."
+    # ── 리그레이션 섹션 ──
+    regression_lines = []
+    for friday, assignee in sorted(regression_by_friday.items()):
+        friday_label = _date_label(friday)
 
-    return reply
+        if assignee is None:
+            regression_lines.append(f"*{friday_label} 주*  >담당자 없음 (티켓 미등록)")
+            continue
+
+        name = assignee["display_name"]
+        issue_key = assignee["issue_key"]
+
+        if _is_same_user(poster_username, assignee["slack_username"]):
+            regression_lines.append(f"*{friday_label} 주*  (<{_jira_url(issue_key)}|{issue_key}>)\n>:warning: {name}  ← *본인*")
+            warnings.append(f"• {friday_label} 리그레이션 테스트")
+        else:
+            regression_lines.append(f"*{friday_label} 주*  (<{_jira_url(issue_key)}|{issue_key}>)\n>{name}")
+
+    regression_section = ""
+    if regression_lines:
+        regression_section = "\n\n🧪 *리그레이션 테스트 담당자*\n\n" + "\n\n".join(regression_lines)
+
+    # ── 경고 섹션 ──
+    warning_section = ""
+    if warnings:
+        warning_section = "\n\n⚠️ *일정 변경 필요!*\n" + "\n".join(warnings) + "\n담당자를 변경해 주세요."
+
+    return oncall_section + regression_section + warning_section
+
+
+def _jira_url(issue_key: str) -> str:
+    return f"https://croquis.atlassian.net/browse/{issue_key}"
 
 
 @app.event("message")
 def handle_message(event, client, say, logger):
-    # 봇 메시지만 무시 (무한루프 방지), 스레드 댓글은 허용
+    # 봇 메시지만 무시
     if event.get("bot_id"):
         return
 
@@ -119,34 +138,38 @@ def handle_message(event, client, say, logger):
 
     logger.info(f"🤖 LLM 판단: {parsed}")
 
-    if not parsed["is_vacation"]:
-        logger.info(f"⏭ 휴가 공지 아님: {parsed['reason']}")
+    if not parsed["is_vacation"] or not parsed["dates"]:
+        logger.info(f"⏭ 휴가 공지 아님: {parsed.get('reason')}")
         return
 
-    if not parsed["dates"]:
-        logger.info("⚠️ 날짜 추출 실패")
-        return
-
-    # 메시지 작성자 username 조회
+    # 작성자 Slack username
     poster_username = _get_slack_username(client, event.get("user", ""))
-    logger.info(f"👤 작성자 username: {poster_username}")
+    logger.info(f"👤 작성자: {poster_username}")
 
-    # PagerDuty 조회
+    dates = [date.fromisoformat(d) for d in parsed["dates"]]
+
+    # PagerDuty 온콜 조회
     dates_oncall = {}
-    for d_str in parsed["dates"]:
+    for d in dates:
         try:
-            d = date.fromisoformat(d_str)
             platforms = get_oncall_by_platform(d)
-            logger.info(f"🔍 {d_str} 온콜: {platforms}")
-            dates_oncall[d_str] = platforms
+            logger.info(f"🔍 온콜 {d}: {platforms}")
+            dates_oncall[d.isoformat()] = platforms
         except Exception as e:
-            logger.error(f"❌ PagerDuty 조회 실패 ({d_str}): {e}", exc_info=True)
+            logger.error(f"❌ PagerDuty 조회 실패 ({d}): {e}", exc_info=True)
             say(text="⚠️ PagerDuty 조회 중 오류가 발생했어요.", thread_ts=event["ts"])
             return
 
-    reply = _build_reply(dates_oncall, poster_username)
+    # Jira 리그레이션 담당자 조회
+    regression_by_friday = {}
+    try:
+        regression_by_friday = get_regression_assignees_for_dates(dates)
+        logger.info(f"🧪 리그레이션: {regression_by_friday}")
+    except Exception as e:
+        logger.warning(f"⚠️ Jira 조회 실패 (무시하고 계속): {e}")
+
+    reply = _build_reply(dates_oncall, regression_by_friday, poster_username)
     thread_ts = event.get("thread_ts") or event["ts"]
-    logger.info(f"💬 답글 전송: thread_ts={thread_ts}")
     say(text=reply, thread_ts=thread_ts)
 
 
